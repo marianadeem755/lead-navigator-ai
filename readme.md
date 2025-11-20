@@ -1,6 +1,6 @@
 # Buyers Analytics Dashboard
 
-## 📊 Overview
+## Overview
 
 - A Streamlit-based analytics platform for analyzing buyer behavior, demographic segmentation, and conversion metrics. 
 - Built for marketing teams to identify high-converting audience segments and optimize targeting strategies.
