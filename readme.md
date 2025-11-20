@@ -1,4 +1,4 @@
-# Buyers Analytics Dashboard
+# Lead Navigator AI - Buyers Analytics Dashboard
 
 ## Overview
 
