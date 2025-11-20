@@ -608,53 +608,50 @@ def load_data(uploaded_file=None):
         try:
             file_content = uploaded_file.read()
             file_hash = get_file_hash(file_content)
+            
             if st.session_state.current_file_hash == file_hash:
                 return st.session_state.data
-
+            
             uploaded_file.seek(0)
-            file_extension = uploaded_file.name.lower().split('.')[-1]
-
-            if file_extension in ['xlsx', 'xls']:
-                # === EXCEL-SPECIFIC FIX FOR MERGED CELLS & JUNK HEADERS ===
-                df = pd.read_excel(uploaded_file, engine='openpyxl', header=None)  # Read without assuming header
-
-                # Find the actual header row (look for "Rank" and "Combo Size")
-                header_row_idx = None
-                for idx, row in df.iterrows():
-                    row_str = ' '.join(row.astype(str).str.lower())
-                    if 'rank' in row_str and ('combo size' in row_str or 'combo_size' in row_str):
-                        header_row_idx = idx
-                        break
-
-                if header_row_idx is None:
-                    st.error("Could not find header row. Looking for columns like 'Rank', 'Combo Size', etc.")
-                    return None
-
-                # Re-read the file, skipping rows above the real header
-                uploaded_file.seek(0)
-                df = pd.read_excel(uploaded_file, engine='openpyxl', skiprows=header_row_idx)
-
-            else:  # CSV
-                # Your existing CSV logic (keep it, it's already good)
-                uploaded_file.seek(0)
-                first_lines = [uploaded_file.readline().decode('utf-8', errors='ignore') for _ in range(10)]
-                uploaded_file.seek(0)
-
-                skip_rows = 0
-                for i, line in enumerate(first_lines):
-                    if 'rank' in line.lower() and ('combo size' in line.lower() or 'combo_size' in line.lower()):
-                        skip_rows = i
-                        break
-                    if 'visitors =' in line.lower() or 'combo conversion' in line.lower():
-                        skip_rows = i + 1
-
+            
+            first_lines = []
+            for i, line in enumerate(uploaded_file):
+                if i < 5:
+                    first_lines.append(line.decode('utf-8') if isinstance(line, bytes) else line)
+                else:
+                    break
+            
+            uploaded_file.seek(0)
+            skip_rows = 0
+            
+            if 'Combo Conversion' in first_lines[0] or 'visitors =' in first_lines[0]:
+                skip_rows = 1
+                if len(first_lines) > 1 and 'Min Visitors' in first_lines[1] and '40' in first_lines[1]:
+                    skip_rows = 2
+            
+            if skip_rows > 0:
                 df = pd.read_csv(uploaded_file, skiprows=skip_rows)
-
-            # === REST OF YOUR CLEANUP CODE (unchanged) ===
+            else:
+                df = pd.read_csv(uploaded_file)
+            
             df.columns = df.columns.str.strip()
-            df = df.dropna(how='all').reset_index(drop=True)
-
-            # Normalize column names
+            
+            if any('Unnamed' in str(col) for col in df.columns):
+                uploaded_file.seek(0)
+                lines = uploaded_file.readlines()
+                
+                header_line_idx = None
+                for idx, line in enumerate(lines):
+                    line_str = line.decode('utf-8') if isinstance(line, bytes) else line
+                    if 'Rank' in line_str and 'Combo Size' in line_str:
+                        header_line_idx = idx
+                        break
+                
+                if header_line_idx is not None:
+                    uploaded_file.seek(0)
+                    df = pd.read_csv(uploaded_file, skiprows=header_line_idx)
+                    df.columns = df.columns.str.strip()
+            
             column_mapping = {
                 'Purchaser': 'Purchasers',
                 'Conversion%': 'Conversion %',
@@ -663,13 +660,20 @@ def load_data(uploaded_file=None):
                 'ComboSize': 'Combo Size',
                 'Min_Visitors': 'Min Visitors',
                 'MinVisitors': 'Min Visitors',
+                'Combo Cc': 'Combo_Cc',
+                'ComboConversion %': 'Conversion %'
             }
-            df.rename(columns=column_mapping, inplace=True)
-
+            
+            for old_col, new_col in column_mapping.items():
+                if old_col in df.columns:
+                    df.rename(columns={old_col: new_col}, inplace=True)
+            
             required_columns = ['Rank', 'Combo Size', 'Visitors', 'Purchasers', 'Conversion %']
             missing_columns = [col for col in required_columns if col not in df.columns]
+            
             if missing_columns:
-                st.info(f"Available columns: {list(df.columns)}")
+                st.info(f"Available columns: {', '.join(df.columns.tolist())}")
+                
                 with st.expander("Raw File Preview (first 10 lines)"):
                     uploaded_file.seek(0)
                     for i, line in enumerate(uploaded_file):
@@ -677,49 +681,47 @@ def load_data(uploaded_file=None):
                             st.code(line.decode('utf-8') if isinstance(line, bytes) else line)
                         else:
                             break
+                
                 return None
-
-            # Convert to numeric
+            
             df['Rank'] = pd.to_numeric(df['Rank'], errors='coerce')
             df['Combo Size'] = pd.to_numeric(df['Combo Size'], errors='coerce')
             df['Visitors'] = pd.to_numeric(df['Visitors'], errors='coerce')
             df['Purchasers'] = pd.to_numeric(df['Purchasers'], errors='coerce')
-
-            # === FIXED CONVERSION % HANDLING (WORKS FOR CSV AND XLSX) ===
-            conv = df['Conversion %'].astype(str).str.replace('%', '', regex=False)
-            conv = pd.to_numeric(conv, errors='coerce')
-            if conv.between(0, 1).any():        # Excel gave us 0.058
-                conv = conv * 100               # → make it 5.8
-            df['Conversion %'] = conv
-            # ===============================================================
-
-            df = df.dropna(subset=required_columns)
-
+            
+            if df['Conversion %'].dtype == 'object':
+                df['Conversion %'] = df['Conversion %'].str.replace('%', '').astype(float)
+            else:
+                df['Conversion %'] = pd.to_numeric(df['Conversion %'], errors='coerce')
+            
+            df = df.dropna(subset=['Purchasers', 'Conversion %', 'Rank'])
+            
+            for col in df.columns:
+                if df[col].dtype == 'object':
+                    try:
+                        df[col] = pd.to_numeric(df[col], errors='ignore')
+                    except:
+                        df[col] = df[col].astype(str)
+            
             st.session_state.current_file_hash = file_hash
-            st.session_state.data = df
-
-            st.success(f"Loaded {len(df):,} rows successfully!")
-            log_audit(st.session_state.user_email, 'Data Upload', f'{uploaded_file.name} → {len(df)} rows')
-
-            # ADD THESE 3 LINES BELOW (this saves the file forever!)
+            
+            log_audit(st.session_state.user_email, 'Data Upload', 
+                     f'Uploaded file: {uploaded_file.name}, Rows: {len(df)}')
+            
+            file_data_json = df.to_json(orient='records')
+            
             conn = get_db_connection()
             c = conn.cursor()
-            c.execute('''INSERT INTO upload_history 
-                         (user_email, filename, upload_date, row_count, file_data) 
-                         VALUES (?, ?, ?, ?, ?)''',
-                      (st.session_state.user_email, 
-                       uploaded_file.name, 
-                       datetime.now().isoformat(), 
-                       len(df), 
-                       df.to_json(orient='records')))
+            c.execute('INSERT INTO upload_history (user_email, filename, upload_date, row_count, file_data) VALUES (?, ?, ?, ?, ?)',
+                     (st.session_state.user_email, uploaded_file.name, datetime.now().isoformat(), len(df), file_data_json))
             conn.commit()
             conn.close()
-            st.info("File saved to Upload History!")
-
+            
             return df
-
+            
         except Exception as e:
             st.error(f"Error loading file: {e}")
+            import traceback
             st.code(traceback.format_exc())
             return None
     return None
@@ -769,11 +771,7 @@ def show_dashboard():
     
     if st.session_state.data is None:
         st.info("📁 Please upload your buyer data CSV to get started")
-        uploaded_file = st.file_uploader(
-            "Upload Buyer Data (CSV or Excel)",
-            type=['csv', 'xlsx', 'xls'],
-            key='main_uploader'
-        )
+        uploaded_file = st.file_uploader("Upload Buyer Data CSV", type=['csv'], key='main_uploader')
         
         if uploaded_file:
             data = load_data(uploaded_file)
@@ -1359,7 +1357,7 @@ def show_segment_builder(df):
                                 margin=dict(t=80)   # ← ADD THIS LINE (gives space for numbers on top)
                             )
                             st.plotly_chart(fig1, use_container_width=True)
-
+                        
                         with chart_col2:
                             # Conversion rate comparison
                             conversion_chart_data = pd.DataFrame({
@@ -1768,7 +1766,7 @@ def show_buyer_deep_dive(df):
                                 labels={'x': 'Number of Combos', 'y': col_name.replace('_', ' ').title()},
                                 hover_data=[]  # We will set custom hover below
                             )
-
+                            
                             # Make hover beautiful and clear
                             fig.update_traces(
                                 hovertemplate=
@@ -1776,11 +1774,11 @@ def show_buyer_deep_dive(df):
                                 "Combos with this value: <b>%{x}</b><br>" +
                                 "<extra></extra>",  # Removes the ugly "trace 0" box
                                 marker_line_width=[8 if str(idx) == actual_value else 1.5 
-                                                for idx in value_counts.index],
+                                                  for idx in value_counts.index],
                                 marker_line_color=["#f5576c" if str(idx) == actual_value else "#ddd"
-                                                for idx in value_counts.index]
+                                                  for idx in value_counts.index]
                             )
-
+                            
                             fig.update_layout(
                                 title="",
                                 xaxis_title="Number of Combos Containing This Value",
@@ -1896,11 +1894,7 @@ def show_uploads():
     st.divider()
     
     st.subheader("📤 Upload New File")
-    new_file = st.file_uploader(
-        "Upload a new file (CSV or Excel)",
-        type=['csv', 'xlsx', 'xls'],
-        key='uploads_page_uploader'
-    )
+    new_file = st.file_uploader("Upload a new CSV file", type=['csv'], key='uploads_page_uploader')
     
     if new_file:
         data = load_data(new_file)
