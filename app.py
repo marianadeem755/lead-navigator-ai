@@ -1,3 +1,4 @@
+# Load data function
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,6 +13,8 @@ import sqlite3
 import secrets
 import io
 import json
+import re
+
 
 # Custom CSS Styling
 def load_custom_css():
@@ -601,131 +604,1384 @@ def show_auth_page():
                         st.error("Email not found")
                 else:
                     st.warning("Please enter your email")
+# ============================================
+# ENHANCED CSV DETECTION AND detect_exc
+# ============================================
 
-# Load data function
-def load_data(uploaded_file=None):
-    if uploaded_file is not None:
-        try:
-            file_content = uploaded_file.read()
-            file_hash = get_file_hash(file_content)
-            
-            if st.session_state.current_file_hash == file_hash:
-                return st.session_state.data
-            
-            uploaded_file.seek(0)
-            
-            first_lines = []
-            for i, line in enumerate(uploaded_file):
-                if i < 5:
-                    first_lines.append(line.decode('utf-8') if isinstance(line, bytes) else line)
-                else:
-                    break
-            
-            uploaded_file.seek(0)
-            skip_rows = 0
-            
-            if 'Combo Conversion' in first_lines[0] or 'visitors =' in first_lines[0]:
-                skip_rows = 1
-                if len(first_lines) > 1 and 'Min Visitors' in first_lines[1] and '40' in first_lines[1]:
-                    skip_rows = 2
-            
-            if skip_rows > 0:
-                df = pd.read_csv(uploaded_file, skiprows=skip_rows)
-            else:
-                df = pd.read_csv(uploaded_file)
-            
-            df.columns = df.columns.str.strip()
-            
-            if any('Unnamed' in str(col) for col in df.columns):
-                uploaded_file.seek(0)
-                lines = uploaded_file.readlines()
+def detect_csv_format(df, uploaded_file):
+    """
+    Detects which format the CSV is and returns format type
+    Supports multiple formats from your images
+    """
+    columns = [col.strip().upper() for col in df.columns]
+    columns_str = ' '.join(columns)
+    
+    # ========== NEW: Check for Excel-style multi-header format FIRST ==========
+    is_excel_style, header_row, metadata = detect_excel_style_headers(df)
+    if is_excel_style:
+        st.info(f"🔧 Detected Excel-style format with headers at row {header_row + 1}")
+        return 'excel_multi_header'
+     # ========== NEW: Check for multi-table attribute format ==========
+    is_multi_table, table_starts, metadata = detect_multi_table_attribute_format(df)
+    if is_multi_table:
+        st.info(f"🔧 Detected multi-table format with {len(table_starts)} attribute tables")
+        return 'multi_table_attributes'
+    
+    # Format 4: Original Combo Format (Rank, Combo Size, Visitors, Purchasers) - CHECK FIRST
+    combo_indicators = ['RANK', 'COMBO SIZE', 'VISITORS', 'PURCHASERS']
+    if all(ind in columns for ind in combo_indicators):
+        return 'combo'
+    
+    # Format 2: Gender Analysis Format (Attribute Visitors, Purchasers, Conversion Rate)
+    gender_indicators = ['ATTRIBUTE VISITORS', 'PURCHASERS', 'CONVERSION']
+    if any(ind in columns_str for ind in gender_indicators):
+        return 'gender_analysis'
+    
+    # Format 3: Purchase Email Format (Purchase, Email, Age_Range, Gender)
+    if 'PURCHASE' in columns and any(demo in columns_str for demo in ['AGE_RANGE', 'GENDER', 'INCOME']):
+        return 'purchase_email'
+    
+    # Format 5: UUID Format (with SKIPTRACE, COMPANY fields)
+    if 'UUID' in columns or 'SKIPTRACE' in columns_str or 'FIRST_NAME' in columns:
+        return 'uuid_enriched'
+    
+    # Format 1: Shopify Export Format (Order #, Billing Name, Lineitem, etc.)
+    shopify_indicators = ['ORDER', 'BILLING', 'LINEITEM', 'PAID', 'SHIPPING']
+    if sum(1 for ind in shopify_indicators if ind in columns_str) >= 2:
+        return 'shopify'
+    
+    # Check if it has demographic + numeric data (generic e-commerce/purchase data)
+    has_demographics = any(demo in columns_str for demo in ['AGE', 'GENDER', 'INCOME', 'STATE', 'MARRIED'])
+    has_order_data = any(order in columns_str for order in ['ORDER', 'PURCHASE', 'QUANTITY', 'TOTAL', 'PRICE'])
+    
+    if has_demographics and has_order_data:
+        return 'shopify'  # Treat as shopify-like format
+    
+    if has_demographics:
+        return 'purchase_email'  # Generic demographic data
+    
+    # ========== ADD THIS SECTION HERE (BEFORE 'unknown') ==========
+    # Format 6: Attribute Conversion Table (Value, Visitors, Purchasers, Conversion %)
+    attribute_conversion_indicators = ['VALUE', 'VISITORS', 'PURCHASERS', 'CONVERSION']
+    has_value_col = 'VALUE' in columns or 'ATTRIBUTE VALUE' in columns_str
+    has_metrics = all(ind in columns_str for ind in ['VISITORS', 'PURCHASERS'])
+    
+    # Check if there's a demographic attribute name before the table
+    if has_value_col and has_metrics:
+        return 'attribute_conversion'
+    
+    # Alternative: Check if columns match the exact pattern
+    if len(df.columns) >= 3 and len(df.columns) <= 5:
+        col_names = [c.upper() for c in df.columns if 'NAN' not in str(c).upper()]
+        if any('VALUE' in c for c in col_names) and 'VISITORS' in ' '.join(col_names) and 'PURCHASERS' in ' '.join(col_names):
+            return 'attribute_conversion'
+    # ========== END OF ADDITION ==========
+    
+    return 'unknown'
+
+def fix_duplicate_columns(df):
+    """
+    FIXES DUPLICATE COLUMN NAMES
+    This handles 'nan', 'Unnamed', and duplicate columns
+    """
+    # Step 1: Replace 'nan' strings with empty
+    df.columns = df.columns.astype(str)
+    
+    # Step 2: Remove actual 'nan' and 'Unnamed' columns
+    df = df.loc[:, ~df.columns.str.contains('nan|Unnamed', case=False, na=False)]
+    
+    # Step 3: Make column names unique by adding suffix to duplicates
+    cols = pd.Series(range(len(df.columns)))
+    for dup in df.columns[df.columns.duplicated(keep=False)]:
+        cols[df.columns == dup] = (df.columns == dup).cumsum()
+    df.columns = [f"{x}_{y}" if y != 0 else x for x, y in zip(df.columns, cols)]
+    
+    # Step 4: Drop completely empty columns
+    df = df.loc[:, (df.astype(str).applymap(lambda x: x.strip()) != '').any(axis=0)]
+    
+    return df
+def detect_excel_style_headers(df):
+    """
+    Detects if CSV has Excel-style multi-row headers with metadata rows above the actual headers
+    
+    Pattern to detect:
+    - Row 1: Descriptive text or merged cell content
+    - Row 2: May contain metadata like "Min Visitors: 400"
+    - Row 3: Empty or spacer
+    - Row 4+: Actual column headers
+    
+    Returns: (is_excel_style, header_row_index, metadata)
+    """
+    if len(df) < 4:
+        return False, None, {}
+    
+    metadata = {}
+    
+    # Check first 5 rows for patterns
+    for idx in range(min(5, len(df))):
+        row = df.iloc[idx]
+        row_str = ' '.join(row.astype(str).tolist()).upper()
+        
+        # Pattern 1: Check if row contains "RANK" + other combo-related columns
+        if 'RANK' in row_str and 'VISITORS' in row_str and 'PURCHASERS' in row_str:
+            # Found the actual header row!
+            if idx > 0:  # Headers are NOT in first row = Excel style
+                # Extract metadata from rows above
+                for meta_idx in range(idx):
+                    meta_row = df.iloc[meta_idx]
+                    meta_text = ' '.join(meta_row.astype(str).tolist())
+                    
+                    # Look for "Min Visitors" or similar metadata
+                    if 'MIN' in meta_text.upper() and 'VISITOR' in meta_text.upper():
+                        # Extract the number
+                        import re
+                        numbers = re.findall(r'\d+', meta_text)
+                        if numbers:
+                            metadata['min_visitors'] = int(numbers[0])
                 
-                header_line_idx = None
-                for idx, line in enumerate(lines):
-                    line_str = line.decode('utf-8') if isinstance(line, bytes) else line
-                    if 'Rank' in line_str and 'Combo Size' in line_str:
-                        header_line_idx = idx
+                return True, idx, metadata
+    
+    return False, None, {}
+def detect_multi_table_attribute_format(df):
+    """
+    Detects multi-table attribute conversion format where multiple demographic
+    tables are stacked vertically in one CSV.
+    
+    Pattern:
+    - Row 1: Main title (e.g., "Attribute Conversion Tables")
+    - Rows 2-X: Metadata rows
+    - Multiple tables, each with:
+      - Attribute name row (e.g., "SKIPTRACE_CREDIT_RATING")
+      - Header row ("Value | Visitors | Purchasers | Conversion %")
+      - Data rows
+    
+    Returns: (is_multi_table, table_starts, metadata)
+    """
+    if len(df) < 10:
+        return False, [], {}
+    
+    table_starts = []
+    metadata = {}
+    
+    # Look for attribute name patterns
+    attribute_keywords = [
+        'SKIPTRACE', 'DEPARTMENT', 'SENIORITY', 'AGE', 'INCOME',
+        'CREDIT', 'ETHNIC', 'GENDER', 'STATE', 'MARRIED'
+    ]
+    
+    for idx in range(len(df)):
+        row = df.iloc[idx]
+        row_str = ' '.join(row.astype(str).tolist()).upper()
+        
+        # Check if this row looks like an attribute name
+        if any(keyword in row_str for keyword in attribute_keywords):
+            # Check if next row has "Value, Visitors, Purchasers" headers
+            if idx + 1 < len(df):
+                next_row = df.iloc[idx + 1]
+                next_row_str = ' '.join(next_row.astype(str).tolist()).upper()
+                
+                if 'VALUE' in next_row_str and 'VISITORS' in next_row_str and 'PURCHASERS' in next_row_str:
+                    # Found a table!
+                    attribute_name = row.iloc[0] if pd.notna(row.iloc[0]) else f"ATTRIBUTE_{idx}"
+                    table_starts.append({
+                        'attribute_name': str(attribute_name).strip(),
+                        'header_row': idx + 1,
+                        'data_start': idx + 2
+                    })
+    
+    # Extract metadata from top rows if available
+    if len(table_starts) > 0:
+        first_table_start = table_starts[0]['header_row']
+        for meta_idx in range(min(first_table_start, 10)):
+            meta_row = df.iloc[meta_idx]
+            meta_text = ' '.join(meta_row.astype(str).tolist())
+            
+            # Look for "# unique p" or similar metadata
+            if 'UNIQUE' in meta_text.upper():
+                numbers = re.findall(r'\d+', meta_text)
+                if numbers:
+                    metadata['unique_purchasers'] = int(numbers[0])
+    
+    is_multi_table = len(table_starts) >= 2
+    
+    return is_multi_table, table_starts, metadata
+def transform_shopify_to_combo(df):
+    """
+    Transforms Shopify export format to combo format
+    """
+    st.info("🔄 Detected Shopify format - transforming to combo format...")
+    
+    # Clean column names
+    df.columns = df.columns.str.strip()
+    
+    # Show what columns we found
+    with st.expander("🔍 Columns found in your file"):
+        st.write(list(df.columns))
+    
+    # Group by demographic attributes and calculate metrics
+    demographic_cols = []
+    for col in df.columns:
+        col_upper = col.upper()
+        if any(keyword in col_upper for keyword in ['AGE_RANGE', 'AGE', 'GENDER', 'MARRIED', 'INCOME_RANGE', 
+                                                      'INCOME', 'NET_WORTH', 'HOMEOWNER', 'CHILDREN', 
+                                                      'STATE', 'PROVINCE', 'CREDIT', 'SKIPTRACE']):
+            demographic_cols.append(col)
+    
+    if not demographic_cols:
+        st.warning("⚠️ No demographic columns found. Searching for any groupable columns...")
+        # Find any non-order columns to group by
+        skip_cols = ['Order #', 'Order', 'Paid at', 'Subtotal', 'Total', 'Discount Code', 
+                     'Discount Amount', 'Shipping Method', 'Order Date', 'Lineitem quantity',
+                     'Lineitem name', 'Lineitem price', 'Quantity', 'Sale Price', 'SKU',
+                     'Billing Phone', 'Shipping Phone', 'Notes', 'Payment Method', 'Tags',
+                     'Phone', 'UUID', 'FIRST_NAME', 'LAST_NAME']
+        
+        for col in df.columns:
+            if col not in skip_cols and not any(skip in col for skip in skip_cols):
+                if df[col].nunique() < len(df) * 0.8:  # Column has some repeated values
+                    demographic_cols.append(col)
+                    if len(demographic_cols) >= 5:  # Limit to 5 columns
                         break
+    
+    if not demographic_cols:
+        st.error("❌ Could not find any columns to group by. Using first column.")
+        demographic_cols = [df.columns[0]]
+    
+    st.info(f"📊 Grouping by: {', '.join(demographic_cols)}")
+    
+    # Count unique orders/purchases
+    df['_Purchasers'] = 1  # Each row is a purchase
+    
+    # Find a column to count as visitors (prefer Email, Order #, or any unique identifier)
+    visitor_col = None
+    for possible_col in ['Email', 'email', 'Order #', 'Order', df.columns[0]]:
+        if possible_col in df.columns:
+            visitor_col = possible_col
+            break
+    
+    if visitor_col is None:
+        visitor_col = df.columns[0]
+    
+    st.info(f"📈 Using '{visitor_col}' to count visitors")
+    
+    # Group by demographics
+    agg_dict = {'_Purchasers': 'sum'}
+    if visitor_col in df.columns:
+        agg_dict[visitor_col] = 'count'
+    
+    grouped = df.groupby(demographic_cols, dropna=False).agg(agg_dict).reset_index()
+    
+    grouped.rename(columns={'_Purchasers': 'Purchasers'}, inplace=True)
+    
+    if visitor_col in grouped.columns:
+        grouped.rename(columns={visitor_col: 'Visitors'}, inplace=True)
+    else:
+        grouped['Visitors'] = grouped['Purchasers'] * 20  # Estimate visitors
+    
+    # Calculate conversion
+    grouped['Conversion %'] = (grouped['Purchasers'] / grouped['Visitors'] * 100).round(2)
+    
+    # Add required columns
+    grouped['Rank'] = range(1, len(grouped) + 1)
+    grouped['Combo Size'] = len(demographic_cols)
+    grouped['Min Visitors'] = 40
+    
+    # Sort by conversion
+    grouped = grouped.sort_values('Conversion %', ascending=False).reset_index(drop=True)
+    grouped['Rank'] = range(1, len(grouped) + 1)
+    
+    st.success(f"✅ Transformed {len(df)} Shopify orders into {len(grouped)} combo segments!")
+    
+    return grouped
+
+def transform_gender_analysis_to_combo(df):
+    """
+    Transforms Gender/Income analysis format to combo format
+    FIXED: Handles summary rows and duplicate columns properly
+    """
+    st.info("🔄 Detected analysis format - transforming to combo format...")
+    
+    df.columns = df.columns.str.strip()
+    
+    # ========== STEP 1: REMOVE DUPLICATE/NAN COLUMNS ==========
+    # Remove columns named 'nan' or 'Unnamed'
+    df = df.loc[:, ~df.columns.astype(str).str.contains('nan|unnamed', case=False, regex=False)]
+    
+    # Show what columns we found
+    with st.expander("🔍 Analysis format columns found"):
+        st.write(list(df.columns))
+        st.dataframe(df.head(3), use_container_width=True)
+    
+    # ========== STEP 2: IDENTIFY THE GROUPING COLUMN ==========
+    group_col = None
+    skip_columns = ['Attribute Visitors', 'Purchasers', 'Conversion Rate', 'Conversion Visitors', 
+                    'Conversion', 'Conversion [Female]', 'Purchasers [Female]', 'Visitors', 
+                    'Attribute Visitors (Female)', 'Conversion Visitors (Female)', 
+                    'Conversion Visitors [Female]']
+    
+    for col in df.columns:
+        if col not in skip_columns and not any(skip in col for skip in ['Visitors', 'Purchasers', 'Conversion']):
+            group_col = col
+            break
+    
+    if group_col is None:
+        group_col = df.columns[0]
+    
+    st.info(f"📊 Using '{group_col}' as the grouping column")
+    
+    # ========== STEP 3: REMOVE SUMMARY/TOTAL ROWS EARLY ==========
+    # Remove rows with summary values BEFORE processing
+    summary_keywords = ['total', 'sum', 'average', 'conversion (total)', 'grand total', 
+                       'subtotal', 'all', 'overall']
+    
+    if group_col in df.columns:
+        mask = df[group_col].astype(str).str.lower().str.contains('|'.join(summary_keywords), na=False)
+        rows_before = len(df)
+        df = df[~mask]
+        rows_removed = rows_before - len(df)
+        if rows_removed > 0:
+            st.info(f"🗑️ Removed {rows_removed} summary/total rows")
+    
+    # ========== STEP 4: STANDARDIZE COLUMN NAMES ==========
+    column_mapping = {}
+    for col in df.columns:
+        col_upper = col.upper()
+        if 'ATTRIBUTE VISITORS' in col_upper and 'Visitors' not in column_mapping:
+            column_mapping[col] = 'Visitors'
+        elif col_upper == 'PURCHASERS' or (col_upper.startswith('PURCHASERS') and 'Purchasers' not in column_mapping):
+            column_mapping[col] = 'Purchasers'
+        elif 'CONVERSION RATE' in col_upper or col_upper == 'CONVERSION':
+            column_mapping[col] = 'Conversion %'
+    
+    df = df.rename(columns=column_mapping)
+    
+    st.info(f"🔄 Renamed columns to: {list(df.columns)}")
+    
+    # ========== STEP 5: ENSURE VISITORS COLUMN ==========
+    if 'Visitors' not in df.columns:
+        visitor_col = None
+        for col in df.columns:
+            if 'visitor' in col.lower() or 'visits' in col.lower():
+                visitor_col = col
+                break
+        
+        if visitor_col:
+            df.rename(columns={visitor_col: 'Visitors'}, inplace=True)
+            st.info(f"✅ Using '{visitor_col}' as Visitors column")
+        else:
+            st.warning("⚠️ No Visitors column found - will estimate from Purchasers")
+    
+    # ========== STEP 6: ENSURE PURCHASERS COLUMN ==========
+    if 'Purchasers' not in df.columns:
+        purchaser_col = None
+        for col in df.columns:
+            if 'purchaser' in col.lower() and col != group_col:
+                purchaser_col = col
+                break
+        
+        if purchaser_col:
+            df.rename(columns={purchaser_col: 'Purchasers'}, inplace=True)
+            st.info(f"✅ Using '{purchaser_col}' as Purchasers column")
+        else:
+            st.error("❌ Could not find Purchasers column")
+            return None
+    
+    # ========== STEP 7: HANDLE CONVERSION % COLUMN ==========
+    if 'Conversion %' not in df.columns:
+        conversion_col = None
+        for col in df.columns:
+            if 'conversion' in col.lower() and col != group_col:
+                conversion_col = col
+                break
+        
+        if conversion_col:
+            df.rename(columns={conversion_col: 'Conversion %'}, inplace=True)
+            st.info(f"✅ Using '{conversion_col}' as Conversion % column")
+    
+    # ========== STEP 8: CONVERT NUMERIC COLUMNS WITH ERROR HANDLING ==========
+    # Convert Purchasers
+    if 'Purchasers' in df.columns:
+        df['Purchasers'] = pd.to_numeric(df['Purchasers'], errors='coerce')
+    
+    # Convert Visitors
+    if 'Visitors' in df.columns:
+        df['Visitors'] = pd.to_numeric(df['Visitors'], errors='coerce')
+    elif 'Purchasers' in df.columns:
+        # Estimate visitors if not present (assume 5% conversion)
+        df['Visitors'] = (df['Purchasers'] / 0.05).fillna(0).astype(int)
+        st.info("📈 Estimated Visitors column from Purchasers (assuming 5% baseline conversion)")
+    
+    # Handle Conversion % with proper error handling
+    if 'Conversion %' in df.columns:
+        if df['Conversion %'].dtype == 'object':
+            # Clean percentage values more carefully
+            df['Conversion %'] = (df['Conversion %']
+                                 .astype(str)
+                                 .str.replace('%', '', regex=False)
+                                 .str.replace(',', '', regex=False)
+                                 .str.strip())
+            # Convert to numeric, coercing errors to NaN
+            df['Conversion %'] = pd.to_numeric(df['Conversion %'], errors='coerce')
+        else:
+            df['Conversion %'] = pd.to_numeric(df['Conversion %'], errors='coerce')
+    else:
+        # Calculate conversion if we have both Visitors and Purchasers
+        if 'Visitors' in df.columns and 'Purchasers' in df.columns:
+            df['Conversion %'] = (df['Purchasers'] / df['Visitors'] * 100).round(2)
+            st.info("📊 Calculated Conversion % from Visitors and Purchasers")
+    
+    # ========== STEP 9: REMOVE ROWS WITH MISSING CRITICAL DATA ==========
+    rows_before = len(df)
+    df = df.dropna(subset=['Purchasers'])
+    
+    # Also remove rows where Conversion % couldn't be converted
+    if 'Conversion %' in df.columns:
+        df = df.dropna(subset=['Conversion %'])
+    
+    rows_after = len(df)
+    if rows_before - rows_after > 0:
+        st.info(f"🗑️ Removed {rows_before - rows_after} rows with invalid data")
+    
+    # ========== STEP 10: ADD REQUIRED COLUMNS ==========
+    df['Combo Size'] = 1
+    df['Min Visitors'] = 40
+    
+    # Rename the group column to a standard name if it exists
+    if group_col and group_col in df.columns:
+        df.rename(columns={group_col: 'Attribute'}, inplace=True)
+    
+    # ========== STEP 11: FINAL CLEANUP - REMOVE ANY REMAINING SUMMARY ROWS ==========
+    if 'Attribute' in df.columns:
+        df = df[~df['Attribute'].astype(str).str.contains('Total|total|TOTAL|conversion', 
+                                                         na=False, case=False, regex=True)]
+    
+    # ========== STEP 12: SORT AND RANK ==========
+    if 'Conversion %' in df.columns and len(df) > 0:
+        df = df.sort_values('Conversion %', ascending=False).reset_index(drop=True)
+    
+    df['Rank'] = range(1, len(df) + 1)
+    
+    # ========== STEP 13: FINAL VALIDATION ==========
+    if len(df) == 0:
+        st.error("❌ No valid data rows found after cleaning")
+        return None
+    
+    st.success(f"✅ Transformed analysis data into {len(df)} combo segments!")
+    
+    # Show final structure
+    with st.expander("✅ Final transformed data preview"):
+        st.dataframe(df.head(5), use_container_width=True)
+    
+    return df
+
+def transform_purchase_email_to_combo(df):
+    """
+    Transforms Purchase/Email format to combo format
+    FIXED VERSION - Creates proper top combos table
+    """
+    st.info("🔄 Detected purchase/demographic data - transforming to combo format...")
+    
+    # Clean column names
+    df.columns = df.columns.str.strip()
+    
+    st.info(f"📊 Found {len(df)} purchase records")
+    
+    # ========== IDENTIFY DEMOGRAPHIC COLUMNS ==========
+    demographic_keywords = [
+        'AGE', 'GENDER', 'INCOME', 'STATE', 'MARRIED', 'CHILDREN', 
+        'HOMEOWNER', 'HOME_OWNER', 'CREDIT', 'NET_WORTH', 
+        'EDUCATION', 'OCCUPATION', 'ETHNICITY'
+    ]
+    
+    demographic_cols = []
+    skip_cols = ['Purchase', 'Email', 'Order', 'Paid', 'Subtotal', 'Total', 
+                 'Discount', 'Shipping', 'Billing', 'Lineitem', 'Quantity',
+                 'Product', 'Sale', 'Price', 'SKU', 'Zip', 'Phone', 'Notes',
+                 'UUID', 'FIRST_NAME', 'LAST_NAME', 'ADDRESS', 'CITY']
+    
+    for col in df.columns:
+        col_upper = col.upper()
+        # Check if column matches demographic keywords and isn't in skip list
+        if any(keyword in col_upper for keyword in demographic_keywords):
+            if not any(skip in col_upper for skip in skip_cols):
+                demographic_cols.append(col)
+    
+    # If no demographics found, try to find ANY categorical columns
+    if not demographic_cols:
+        st.warning("⚠️ No demographic columns detected. Using all categorical columns...")
+        for col in df.columns:
+            if col not in skip_cols and df[col].dtype == 'object':
+                if df[col].nunique() < len(df) * 0.8:  # Has some repeated values
+                    demographic_cols.append(col)
+                    if len(demographic_cols) >= 5:
+                        break
+    
+    # Fallback: use first 3 columns if still nothing found
+    if not demographic_cols:
+        demographic_cols = [df.columns[0], df.columns[1], df.columns[2]]
+        st.warning(f"⚠️ Using first 3 columns: {', '.join(demographic_cols)}")
+    else:
+        # Limit to top 5 most important demographics
+        demographic_cols = demographic_cols[:5]
+    
+    st.info(f"📊 Grouping by these attributes: **{', '.join(demographic_cols)}**")
+    
+    # ========== COUNT PURCHASES AND VISITORS ==========
+    # Each row = 1 purchase
+    df['_temp_purchase'] = 1
+    
+    # Count unique emails as visitors
+    if 'Email' in df.columns:
+        visitor_col = 'Email'
+    elif 'email' in df.columns:
+        visitor_col = 'email'
+    else:
+        # Use first column if no email column
+        visitor_col = df.columns[0]
+        st.info(f"📧 No email column found, using '{visitor_col}' to count visitors")
+    
+    # ========== GROUP BY DEMOGRAPHICS ==========
+    grouped = df.groupby(demographic_cols, dropna=False).agg({
+        '_temp_purchase': 'sum',           # Count purchases
+        visitor_col: 'nunique'              # Count unique visitors
+    }).reset_index()
+    
+    # Rename columns
+    grouped.rename(columns={
+        '_temp_purchase': 'Purchasers',
+        visitor_col: 'Visitors'
+    }, inplace=True)
+    
+    # ========== CALCULATE CONVERSION RATE ==========
+    grouped['Conversion %'] = (grouped['Purchasers'] / grouped['Visitors'] * 100).round(2)
+    
+    # ========== ADD REQUIRED COLUMNS ==========
+    grouped['Combo Size'] = len(demographic_cols)
+    grouped['Min Visitors'] = 40
+    
+    # ========== SORT BY CONVERSION RATE ==========
+    grouped = grouped.sort_values('Conversion %', ascending=False).reset_index(drop=True)
+    
+    # ========== ADD RANK ==========
+    grouped['Rank'] = range(1, len(grouped) + 1)
+    
+    # ========== REORDER COLUMNS (RANK FIRST) ==========
+    cols = ['Rank', 'Combo Size', 'Visitors', 'Purchasers', 'Conversion %', 'Min Visitors'] + demographic_cols
+    grouped = grouped[cols]
+    
+    st.success(f"✅ Created {len(grouped)} combo segments from {len(df)} purchase records!")
+    
+    # Show preview
+    with st.expander("✅ Preview of Top 5 Combos"):
+        st.dataframe(grouped.head(5), use_container_width=True)
+    
+    return grouped
+
+def transform_uuid_to_combo(df):
+    """
+    Transforms UUID/enriched data format to combo format
+    """
+    st.info("🔄 Detected enriched data format - transforming to combo format...")
+    
+    df.columns = df.columns.str.strip()
+    
+    # Select key demographic columns
+    demographic_cols = []
+    priority_cols = ['AGE_RANGE', 'GENDER', 'INCOME_RANGE', 'NET_WORTH', 'MARRIED', 
+                     'HOMEOWNER', 'CHILDREN', 'PERSONAL_STATE', 'COMPANY_INDUSTRY',
+                     'SKIPTRACE_CREDIT_RATING', 'SKIPTRACE_ETHNIC_CODE']
+    
+    for col in priority_cols:
+        if col in df.columns:
+            demographic_cols.append(col)
+    
+    if not demographic_cols:
+        # Fallback to any demographic-like columns
+        for col in df.columns:
+            if any(keyword in col.upper() for keyword in ['AGE', 'GENDER', 'INCOME', 'STATE']):
+                demographic_cols.append(col)
+    
+    if not demographic_cols:
+        st.warning("⚠️ No demographic columns found. Using first available column.")
+        demographic_cols = [df.columns[0]]
+    
+    # Limit to top 5 demographic attributes
+    demographic_cols = demographic_cols[:5]
+    
+    # Group by demographics
+    grouped = df.groupby(demographic_cols, dropna=False).size().reset_index(name='Purchasers')
+    
+    # Estimate visitors (assume 5% conversion rate baseline)
+    grouped['Visitors'] = (grouped['Purchasers'] / 0.05).astype(int)
+    
+    # Calculate conversion
+    grouped['Conversion %'] = (grouped['Purchasers'] / grouped['Visitors'] * 100).round(2)
+    
+    # Add required columns
+    grouped['Rank'] = range(1, len(grouped) + 1)
+    grouped['Combo Size'] = len(demographic_cols)
+    grouped['Min Visitors'] = 40
+    
+    # Sort by conversion
+    grouped = grouped.sort_values('Conversion %', ascending=False).reset_index(drop=True)
+    grouped['Rank'] = range(1, len(grouped) + 1)
+    
+    st.success(f"✅ Transformed {len(df)} enriched records into {len(grouped)} combo segments!")
+    
+    return grouped
+def transform_attribute_conversion_to_combo(df):
+    """
+    Transforms Attribute Conversion Tables to combo format
+    
+    Input format (from your images):
+    - Column 1: "Value" (e.g., A, U, B for Credit Rating)
+    - Column 2: "Visitors" 
+    - Column 3: "Purchasers"
+    - Column 4: "Conversion %"
+    
+    The attribute name (like SKIPTRACE_CREDIT_RATING) is often in a row above the headers
+    """
+    st.info("🔄 Detected Attribute Conversion Table format - transforming...")
+    
+    # Clean column names
+    df.columns = df.columns.str.strip().str.upper()
+    
+    with st.expander("🔍 Detected Attribute Conversion Table"):
+        st.write("**Columns found:**", list(df.columns))
+        st.dataframe(df.head(10), use_container_width=True)
+    
+    # Try to detect the attribute name from the data
+    # Often it's in the first few rows or in the filename
+    attribute_name = "DEMOGRAPHIC_ATTRIBUTE"
+    
+    # Check if first row contains the attribute name (common pattern)
+    first_row_text = ' '.join(df.iloc[0].astype(str).tolist()).upper()
+    if any(keyword in first_row_text for keyword in ['SKIPTRACE', 'AGE', 'CREDIT', 'ETHNIC', 'INCOME']):
+        # Found attribute name in first row - extract it
+        potential_name = df.iloc[0, 0] if pd.notna(df.iloc[0, 0]) else "ATTRIBUTE"
+        attribute_name = str(potential_name).strip().replace(' ', '_').upper()
+        st.info(f"📋 Detected attribute name: **{attribute_name}**")
+        
+        # Remove the attribute name row and reset
+        df = df.iloc[1:].reset_index(drop=True)
+        
+        # Re-clean column names after removing first row
+        df.columns = df.columns.str.strip().str.upper()
+
+    # Alternative: Check if columns match the exact pattern from your images
+    if len(df.columns) >= 3 and len(df.columns) <= 5:
+        col_names = [c.upper() for c in df.columns if 'NAN' not in str(c).upper()]
+        if any('VALUE' in c for c in col_names) and 'VISITORS' in ' '.join(col_names) and 'PURCHASERS' in ' '.join(col_names):
+            return 'attribute_conversion'
+    
+    # Standardize column names
+    column_mapping = {}
+    for col in df.columns:
+        col_upper = col.upper()
+        if col_upper in ['VALUE', 'VAL', 'ATTRIBUTE VALUE']:
+            column_mapping[col] = 'Value'
+        elif 'VISITOR' in col_upper:
+            column_mapping[col] = 'Visitors'
+        elif 'PURCHASER' in col_upper:
+            column_mapping[col] = 'Purchasers'
+        elif 'CONVERSION' in col_upper:
+            column_mapping[col] = 'Conversion %'
+    
+    df = df.rename(columns=column_mapping)
+    
+    # Ensure required columns exist
+    required = ['Value', 'Visitors', 'Purchasers']
+    missing = [col for col in required if col not in df.columns]
+    
+    if missing:
+        st.error(f"❌ Missing required columns: {', '.join(missing)}")
+        st.info("💡 Expected columns: Value, Visitors, Purchasers, Conversion %")
+        return None
+    
+    # Convert numeric columns
+    df['Visitors'] = pd.to_numeric(df['Visitors'], errors='coerce')
+    df['Purchasers'] = pd.to_numeric(df['Purchasers'], errors='coerce')
+    
+    # Handle Conversion %
+    if 'Conversion %' in df.columns:
+        if df['Conversion %'].dtype == 'object':
+            df['Conversion %'] = (df['Conversion %']
+                                  .str.replace('%', '', regex=False)
+                                  .str.replace(',', '', regex=False)
+                                  .astype(float))
+        else:
+            df['Conversion %'] = pd.to_numeric(df['Conversion %'], errors='coerce')
+    else:
+        # Calculate conversion if not present
+        df['Conversion %'] = (df['Purchasers'] / df['Visitors'] * 100).round(2)
+    
+    # Remove rows with missing data
+    df = df.dropna(subset=['Visitors', 'Purchasers'])
+    
+    # Remove summary rows (like "Blank/Unk", "Total", etc.)
+    df = df[~df['Value'].astype(str).str.contains('blank|unk|total|sum', case=False, na=False)]
+    
+    # Add the attribute name as a column (so we know what demographic this represents)
+    df[attribute_name] = df['Value']
+    
+    # Add required combo format columns
+    df['Rank'] = range(1, len(df) + 1)
+    df['Combo Size'] = 1  # Single attribute analysis
+    df['Min Visitors'] = 40
+    
+    # Sort by conversion rate
+    df = df.sort_values('Conversion %', ascending=False).reset_index(drop=True)
+    df['Rank'] = range(1, len(df) + 1)
+    
+    # Reorder columns to match combo format
+    cols = ['Rank', 'Combo Size', 'Visitors', 'Purchasers', 'Conversion %', 'Min Visitors', attribute_name]
+    df = df[cols]
+    
+    st.success(f"✅ Transformed {len(df)} attribute values into combo format!")
+    
+    with st.expander("✅ Preview of transformed data"):
+        st.dataframe(df.head(10), use_container_width=True)
+    
+    return df
+def transform_excel_multi_header_to_combo(df):
+    """
+    Transforms Excel-style multi-header CSV to combo format
+    
+    Handles:
+    - Metadata rows before headers (like "Min Visitors: 400")
+    - Empty spacer rows
+    - Actual data headers buried in row 3-5
+    - Merged cell artifacts
+    """
+    st.info("🔄 Detected Excel export format with multi-row headers - restructuring...")
+    
+    # ========== STEP 1: Find the actual header row ==========
+    is_excel_style, header_row_idx, metadata = detect_excel_style_headers(df)
+    
+    if not is_excel_style or header_row_idx is None:
+        st.error("❌ Could not locate header row in Excel format")
+        return None
+    
+    st.info(f"📋 Found column headers at row {header_row_idx + 1}")
+    
+    # ========== STEP 2: Extract metadata from top rows ==========
+    if metadata.get('min_visitors'):
+        st.success(f"✅ Extracted metadata: Min Visitors = {metadata['min_visitors']}")
+    
+    # Show what we're skipping
+    with st.expander("🔍 Rows being skipped (metadata/empty rows)", expanded=False):
+        skipped_df = df.iloc[:header_row_idx]
+        st.dataframe(skipped_df, use_container_width=True)
+    
+    # ========== STEP 3: Rebuild dataframe with correct headers ==========
+    # Use the detected row as column names
+    new_columns = df.iloc[header_row_idx].tolist()
+    
+    # Clean column names
+    new_columns = [str(col).strip() for col in new_columns]
+    
+    # Get data starting from row AFTER the headers
+    new_df = df.iloc[header_row_idx + 1:].copy()
+    new_df.columns = new_columns
+    
+    # Reset index
+    new_df = new_df.reset_index(drop=True)
+    
+    # ========== STEP 4: Remove any remaining empty rows ==========
+    new_df = new_df.dropna(how='all')
+    
+    # ========== STEP 5: Clean column names (remove special characters) ==========
+    new_df.columns = (new_df.columns
+                      .str.strip()
+                      .str.replace('\n', ' ', regex=False)
+                      .str.replace('\r', ' ', regex=False)
+                      .str.replace('  ', ' ', regex=True))
+    
+    # Show cleaned structure
+    with st.expander("✅ Cleaned column structure", expanded=True):
+        st.write("**New Column Names:**")
+        st.code(', '.join(new_df.columns.tolist()))
+        st.write("**First 5 rows of cleaned data:**")
+        st.dataframe(new_df.head(), use_container_width=True)
+    
+    # ========== STEP 6: Validate it's actually combo format now ==========
+    required_cols = ['Rank', 'Combo Size', 'Visitors', 'Purchasers']
+    missing = [col for col in required_cols if col not in new_df.columns]
+    
+    if missing:
+        st.info(f"Available columns: {', '.join(df.columns.tolist())}")
                 
-                if header_line_idx is not None:
-                    uploaded_file.seek(0)
-                    df = pd.read_csv(uploaded_file, skiprows=header_line_idx)
-                    df.columns = df.columns.str.strip()
-            
-            column_mapping = {
-                'Purchaser': 'Purchasers',
-                'Conversion%': 'Conversion %',
-                'Conversion': 'Conversion %',
-                'Combo_Size': 'Combo Size',
-                'ComboSize': 'Combo Size',
-                'Min_Visitors': 'Min Visitors',
-                'MinVisitors': 'Min Visitors',
-                'Combo Cc': 'Combo_Cc',
-                'ComboConversion %': 'Conversion %'
-            }
-            
-            for old_col, new_col in column_mapping.items():
-                if old_col in df.columns:
-                    df.rename(columns={old_col: new_col}, inplace=True)
-            
-            required_columns = ['Rank', 'Combo Size', 'Visitors', 'Purchasers', 'Conversion %']
-            missing_columns = [col for col in required_columns if col not in df.columns]
-            
-            if missing_columns:
-                st.info(f"Available columns: {', '.join(df.columns.tolist())}")
-                
-                with st.expander("Raw File Preview (first 10 lines)"):
+        with st.expander("Raw File Preview (first 10 lines)"):
                     uploaded_file.seek(0)
                     for i, line in enumerate(uploaded_file):
                         if i < 10:
                             st.code(line.decode('utf-8') if isinstance(line, bytes) else line)
                         else:
                             break
+        return None
+    
+    # ========== STEP 7: Convert numeric columns ==========
+    numeric_cols = ['Rank', 'Combo Size', 'Visitors', 'Purchasers', 'Conversion %', 'Min Visitors']
+    
+    for col in numeric_cols:
+        if col in new_df.columns:
+            if new_df[col].dtype == 'object':
+                # Clean percentage signs, dollar signs, commas
+                new_df[col] = (new_df[col].astype(str)
+                              .str.replace('%', '', regex=False)
+                              .str.replace('$', '', regex=False)
+                              .str.replace(',', '', regex=False)
+                              .str.strip())
+            
+            # Convert to numeric
+            new_df[col] = pd.to_numeric(new_df[col], errors='coerce')
+    
+    # ========== STEP 8: Add Min Visitors from metadata if missing ==========
+    if 'Min Visitors' not in new_df.columns or new_df['Min Visitors'].isna().all():
+        if metadata.get('min_visitors'):
+            new_df['Min Visitors'] = metadata['min_visitors']
+            st.info(f"✅ Added Min Visitors column from metadata: {metadata['min_visitors']}")
+        else:
+            new_df['Min Visitors'] = 40  # Default
+    
+    # ========== STEP 9: Calculate Conversion % if missing ==========
+    if 'Conversion %' not in new_df.columns or new_df['Conversion %'].isna().all():
+        if 'Visitors' in new_df.columns and 'Purchasers' in new_df.columns:
+            new_df['Conversion %'] = (new_df['Purchasers'] / new_df['Visitors'] * 100).round(2)
+            st.info("📊 Calculated Conversion % from Visitors and Purchasers")
+    
+    # ========== STEP 10: Remove rows with missing critical data ==========
+    rows_before = len(new_df)
+    new_df = new_df.dropna(subset=['Rank', 'Purchasers'])
+    rows_after = len(new_df)
+    
+    if rows_before - rows_after > 0:
+        st.info(f"🗑️ Removed {rows_before - rows_after} rows with invalid data")
+    
+    # ========== STEP 11: Ensure Rank is properly sorted ==========
+    new_df = new_df.sort_values('Rank').reset_index(drop=True)
+    
+    # ========== STEP 12: Final validation ==========
+    if len(new_df) == 0:
+        st.error("❌ No valid data rows after cleaning")
+        return None
+    
+    st.success(f"✅ Successfully transformed Excel format into {len(new_df)} combo rows!")
+    
+    # Show final preview
+    with st.expander("✅ Final transformed data preview"):
+        st.dataframe(new_df.head(10), use_container_width=True)
+    
+    return new_df
+def transform_multi_table_attributes_to_combo(df):
+    """
+    FIXED VERSION: Transforms multi-table attribute format to combo format
+    
+    Handles the structure from your images:
+    - Row with attribute name (e.g., "Income Range")
+    - Row with headers: "Attribute Value | Visitors (T) | Purchasers | Conversion Rate | Visitors (M) | ..."
+    - Data rows
+    - Blank row or separator
+    - Next attribute section
+    """
+    st.info("🔄 Detected multi-table attribute format - parsing all tables...")
+    
+    is_multi, table_starts, metadata = detect_multi_table_attribute_format(df)
+    
+    if not is_multi or len(table_starts) == 0:
+        st.error("❌ Could not detect multiple attribute tables")
+        return None
+    
+    st.info(f"📊 Found {len(table_starts)} attribute tables to parse")
+    
+    # Show detected tables
+    with st.expander("🔍 Detected Attribute Tables"):
+        for i, table_info in enumerate(table_starts, 1):
+            st.write(f"{i}. **{table_info['attribute_name']}** (header at row {table_info['header_row'] + 1})")
+    
+    # ===== PARSE EACH TABLE =====
+    all_tables = {}
+    
+    for i, table_info in enumerate(table_starts):
+        attr_name = table_info['attribute_name']
+        header_row_idx = table_info['header_row']
+        data_start_idx = table_info['data_start']
+        
+        # Find where this table ends (start of next table or end of data)
+        # ===== IMPROVED: Find where this table ACTUALLY ends =====
+        if i + 1 < len(table_starts):
+            # End at the ATTRIBUTE NAME row of next table (not header row)
+            next_attr_name_row = table_starts[i + 1]['header_row'] - 1
+            data_end_idx = next_attr_name_row
+        else:
+            data_end_idx = len(df)
+
+        # ===== ADDITIONAL SAFETY: Stop at empty rows or new attribute names =====
+        actual_end = data_start_idx
+        for check_idx in range(data_start_idx, data_end_idx):
+            row = df.iloc[check_idx]
+            row_str = ' '.join(row.astype(str).tolist()).strip()
+            
+            # Stop if we hit an empty row
+            if row_str == '' or row_str.lower() == 'nan':
+                break
+            
+            # Stop if we hit a new attribute name (keywords like "Homeowner", "Credit", etc.)
+            attribute_keywords = [
+                'HOMEOWNER', 'CREDIT', 'ETHNIC', 'MARITAL', 'MARRIED', 
+                'CHILDREN', 'EDUCATION', 'VEHICLE', 'LANGUAGE', 'OCCUPATION'
+            ]
+            if any(keyword in row_str.upper() for keyword in attribute_keywords):
+                break
+            
+            actual_end = check_idx + 1
+
+        data_end_idx = actual_end
+        
+        # ===== EXTRACT TABLE DATA =====
+        try:
+            # Get header row
+            header_row = df.iloc[header_row_idx]
+            header_names = [str(col).strip() for col in header_row.tolist()]
+            
+            # Get data rows
+            table_data = df.iloc[data_start_idx:data_end_idx].copy()
+            
+            # Apply headers
+            table_data.columns = header_names
+            
+            # Reset index
+            table_data = table_data.reset_index(drop=True)
+            
+            # ===== CLEAN UP COLUMNS =====
+            # Standardize column names with fuzzy matching
+            column_mapping = {}
+            
+            for col in table_data.columns:
+                col_upper = col.upper().strip()
                 
+                # Match "Attribute Value" or "Value"
+                if 'VALUE' in col_upper or 'ATTRIBUTE' in col_upper:
+                    if 'Value' not in column_mapping.values():
+                        column_mapping[col] = 'Value'
+                
+                # Match visitor columns - handle (T), (M), (F) suffixes
+                elif 'VISITOR' in col_upper:
+                    # For now, prefer the first visitors column
+                    if 'Visitors' not in column_mapping.values():
+                        column_mapping[col] = 'Visitors'
+                
+                # Match purchaser columns
+                elif 'PURCHASER' in col_upper:
+                    if 'Purchasers' not in column_mapping.values():
+                        column_mapping[col] = 'Purchasers'
+                
+                # Match conversion columns
+                elif 'CONVERSION' in col_upper:
+                    if 'Conversion %' not in column_mapping.values():
+                        column_mapping[col] = 'Conversion %'
+            
+            table_data = table_data.rename(columns=column_mapping)
+            
+            st.info(f"📋 {attr_name} columns: {list(table_data.columns)[:5]}...")
+            
+            # ===== ENSURE REQUIRED COLUMNS EXIST =====
+            required = ['Value', 'Visitors', 'Purchasers']
+            
+            # Check if we have them
+            missing = [col for col in required if col not in table_data.columns]
+            
+            if missing:
+                # Try to find alternatives
+                st.warning(f"⚠️ {attr_name}: Missing columns {missing}")
+                
+                # Try to find any numeric columns to use as substitute
+                numeric_cols = table_data.select_dtypes(include=[np.number]).columns.tolist()
+                
+                if len(numeric_cols) < 2:
+                    st.warning(f"❌ {attr_name}: Not enough numeric columns, skipping table")
+                    continue
+            
+            # ===== CONVERT NUMERIC COLUMNS =====
+            for col in ['Visitors', 'Purchasers', 'Conversion %']:
+                if col in table_data.columns:
+                    # More robust conversion
+                    if table_data[col].dtype == 'object':
+                        table_data[col] = (table_data[col].astype(str)
+                                          .str.replace('%', '', regex=False)
+                                          .str.replace(',', '', regex=False)
+                                          .str.strip())
+                    
+                    # Use pandas to_numeric with coercion
+                    table_data[col] = pd.to_numeric(table_data[col], errors='coerce')
+            
+            # ===== REMOVE INVALID ROWS =====
+            # Remove rows with NaN in critical columns
+            before_count = len(table_data)
+            table_data = table_data.dropna(subset=['Value'])
+            
+            if 'Visitors' in table_data.columns and 'Purchasers' in table_data.columns:
+                table_data = table_data.dropna(subset=['Visitors', 'Purchasers'])
+            
+            after_count = len(table_data)
+            
+            if before_count - after_count > 0:
+                st.info(f"🗑️ {attr_name}: Removed {before_count - after_count} invalid rows")
+            
+            # ===== REMOVE SUMMARY ROWS =====
+            summary_keywords = ['blank', 'unk', 'unknown', 'total', 'sum', 'average', 'all']
+            
+            if 'Value' in table_data.columns:
+                initial_len = len(table_data)
+                table_data = table_data[
+                    ~table_data['Value'].astype(str).str.lower().str.contains(
+                        '|'.join(summary_keywords), 
+                        na=False, 
+                        regex=True
+                    )
+                ]
+                if len(table_data) < initial_len:
+                    st.info(f"🗑️ {attr_name}: Removed {initial_len - len(table_data)} summary rows")
+            
+            if len(table_data) == 0:
+                st.warning(f"⚠️ {attr_name}: No valid data rows after cleaning, skipping")
+                continue
+            
+            # ===== RENAME VALUE COLUMN TO ATTRIBUTE NAME =====
+            if 'Value' in table_data.columns:
+                table_data = table_data.rename(columns={'Value': attr_name})
+            
+            # Store the cleaned table
+            all_tables[attr_name] = table_data
+            
+            st.success(f"✅ Parsed {attr_name}: {len(table_data)} values")
+            
+        except Exception as e:
+            st.error(f"❌ Error parsing {attr_name}: {e}")
+            import traceback
+            with st.expander(f"🐛 Error details for {attr_name}"):
+                st.code(traceback.format_exc())
+            continue
+    
+    if len(all_tables) == 0:
+        st.error("❌ No tables could be parsed successfully")
+        return None
+    
+    # ===== COMBINE ALL TABLES INTO WIDE FORMAT =====
+    st.info("🔄 Creating combined wide-format table...")
+    
+    final_rows = []
+    
+    for attr_name, table_df in all_tables.items():
+        for _, row in table_df.iterrows():
+            final_row = {
+                'Visitors': row.get('Visitors', 0),
+                'Purchasers': row.get('Purchasers', 0),
+                'Conversion %': row.get('Conversion %', 0.0),
+                attr_name: row.get(attr_name, '')
+            }
+            final_rows.append(final_row)
+    
+    # Create DataFrame from all rows
+    final_df = pd.DataFrame(final_rows)
+    
+    # Fill NaN values
+    for attr_name in all_tables.keys():
+        if attr_name not in final_df.columns:
+            final_df[attr_name] = ''
+        else:
+            final_df[attr_name] = final_df[attr_name].fillna('').astype(str)
+    
+    # ===== ADD REQUIRED COLUMNS =====
+    final_df['Combo Size'] = 1
+    final_df['Min Visitors'] = 40
+    
+    # Sort by conversion rate
+    final_df = final_df.sort_values('Conversion %', ascending=False).reset_index(drop=True)
+    final_df['Rank'] = range(1, len(final_df) + 1)
+    
+    # ===== REORDER COLUMNS =====
+    attribute_columns = list(all_tables.keys())
+    base_columns = ['Rank', 'Combo Size', 'Visitors', 'Purchasers', 'Conversion %', 'Min Visitors']
+    final_columns = base_columns + attribute_columns
+    
+    final_df = final_df[final_columns]
+    
+    st.success(f"✅ Created {len(final_df)} combo rows from {len(all_tables)} attribute tables!")
+    
+    with st.expander("✅ Final combined table preview"):
+        st.write(f"**Total Rows:** {len(final_df)}")
+        st.write(f"**Attribute Columns:** {', '.join(attribute_columns)}")
+        st.dataframe(final_df.head(20), use_container_width=True)
+    
+    return final_df
+def smart_load_csv(uploaded_file):
+    """
+    FIXED VERSION - Less verbose, cleaner output
+    """
+    try:
+        # Try reading with different encodings
+        encodings = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']
+        df = None
+        
+        for encoding in encodings:
+            try:
+                uploaded_file.seek(0)
+                df_raw = pd.read_csv(uploaded_file, encoding=encoding, low_memory=False, header=None)
+                
+                # Detect Excel-style headers
+                is_excel_style, header_row, metadata = detect_excel_style_headers(df_raw)
+                
+                if is_excel_style:
+                    uploaded_file.seek(0)
+                    df = pd.read_csv(uploaded_file, encoding=encoding, low_memory=False, header=None)
+                else:
+                    # Check for merged headers
+                    first_row = df_raw.iloc[0].astype(str)
+                    first_row_text_count = first_row.str.contains('[A-Za-z]', regex=True, na=False).sum()
+                    
+                    if first_row_text_count <= 2 and len(df_raw) > 1:
+                        uploaded_file.seek(0)
+                        df = pd.read_csv(uploaded_file, encoding=encoding, low_memory=False, header=1)
+                    else:
+                        uploaded_file.seek(0)
+                        df = pd.read_csv(uploaded_file, encoding=encoding, low_memory=False, header=0)
+                
+                break
+                
+            except UnicodeDecodeError:
+                continue
+        
+        if df is None:
+            st.error("❌ Could not read file with any encoding")
+            return None
+        
+        # Clean column names (silently)
+        df.columns = df.columns.astype(str)
+        df.columns = (df.columns
+                      .str.strip()
+                      .str.replace('\n', ' ', regex=False)
+                      .str.replace('\r', ' ', regex=False)
+                      .str.replace('  ', ' ', regex=True)
+                      .str.replace('[^A-Za-z0-9_\s%]', '', regex=True)
+                      .str.strip())
+        
+        # Remove empty rows/columns
+        df = df.dropna(axis=1, how='all')
+        df = df.dropna(how='all')
+        
+        # Fix unnamed columns
+        unnamed_count = sum(1 for col in df.columns if 'Unnamed' in str(col))
+        
+        if unnamed_count > len(df.columns) * 0.5:
+            new_columns = df.iloc[0].astype(str).str.strip().tolist()
+            df.columns = new_columns
+            df = df.iloc[1:].reset_index(drop=True)
+        
+        # Remove nan columns
+        df = df.loc[:, ~df.columns.astype(str).str.contains('nan|unnamed', case=False, regex=False)]
+        df = df.dropna(axis=1, how='all')
+        df = df.dropna(how='all')
+        
+        # Make columns unique
+        if df.columns.duplicated().any():
+            cols = pd.Series(df.columns)
+            for dup in df.columns[df.columns.duplicated(keep=False)]:
+                cols[df.columns.get_loc(dup)] = [f'{dup}_{d_idx}' if d_idx != 0 else dup 
+                                                for d_idx in range(sum(df.columns == dup))]
+            df.columns = cols
+        
+        # Detect format (SILENTLY - no st.info calls here)
+        csv_format = detect_csv_format(df, uploaded_file)
+        
+        # Transform based on format
+        if csv_format == 'excel_multi_header':
+            return transform_excel_multi_header_to_combo(df)
+        elif csv_format == 'multi_table_attributes':
+            return transform_multi_table_attributes_to_combo(df)
+        elif csv_format == 'combo':
+            # Standardize columns
+            df.columns = df.columns.str.strip()
+            
+            for col in ['Rank', 'Combo Size', 'Visitors', 'Purchasers', 'Conversion %', 'Min Visitors']:
+                if col in df.columns:
+                    if df[col].dtype == 'object':
+                        df[col] = (df[col].astype(str)
+                                  .str.replace('%', '', regex=False)
+                                  .str.replace(',', '', regex=False)
+                                  .str.replace('$', '', regex=False)
+                                  .str.strip())
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            df = df.dropna(subset=['Rank'])
+            return df
+        elif csv_format == 'shopify':
+            return transform_shopify_to_combo(df)
+        elif csv_format == 'gender_analysis':
+            return transform_gender_analysis_to_combo(df)
+        elif csv_format == 'purchase_email':
+            return transform_purchase_email_to_combo(df)
+        elif csv_format == 'uuid_enriched':
+            return transform_uuid_to_combo(df)
+        elif csv_format == 'attribute_conversion':
+            return transform_attribute_conversion_to_combo(df)
+        else:
+            # Generic fallback
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            categorical_cols = [col for col in df.columns if col not in numeric_cols][:5]
+            
+            if not categorical_cols:
+                st.error("❌ Cannot process this file format")
+                st.info("💡 Please ensure your CSV has proper column headers")
                 return None
             
-            df['Rank'] = pd.to_numeric(df['Rank'], errors='coerce')
-            df['Combo Size'] = pd.to_numeric(df['Combo Size'], errors='coerce')
-            df['Visitors'] = pd.to_numeric(df['Visitors'], errors='coerce')
-            df['Purchasers'] = pd.to_numeric(df['Purchasers'], errors='coerce')
+            grouped = df.groupby(categorical_cols, dropna=False).size().reset_index(name='Purchasers')
+            grouped['Visitors'] = (grouped['Purchasers'] / 0.05).astype(int)
+            grouped['Conversion %'] = (grouped['Purchasers'] / grouped['Visitors'] * 100).round(2)
+            grouped['Rank'] = range(1, len(grouped) + 1)
+            grouped['Combo Size'] = len(categorical_cols)
+            grouped['Min Visitors'] = 40
             
-            if df['Conversion %'].dtype == 'object':
-                df['Conversion %'] = df['Conversion %'].str.replace('%', '').astype(float)
-            else:
-                df['Conversion %'] = pd.to_numeric(df['Conversion %'], errors='coerce')
+            return grouped
             
-            df = df.dropna(subset=['Purchasers', 'Conversion %', 'Rank'])
+    except Exception as e:
+        st.error(f"❌ Error processing file: {e}")
+        with st.expander("🐛 Error Details"):
+            import traceback
+            st.code(traceback.format_exc())
+        return None
+
+# ============================================
+# REPLACE THE load_data FUNCTION IN YOUR CODE
+# ============================================
+
+def load_data(uploaded_file=None):
+    """
+    FIXED VERSION - Clean handling with proper preview
+    """
+    if uploaded_file is not None:
+        try:
+            file_content = uploaded_file.read()
+            file_hash = hashlib.md5(file_content).hexdigest()
             
-            for col in df.columns:
-                if df[col].dtype == 'object':
-                    try:
-                        df[col] = pd.to_numeric(df[col], errors='ignore')
-                    except:
-                        df[col] = df[col].astype(str)
+            # Check if same file already loaded
+            if st.session_state.current_file_hash == file_hash:
+                return st.session_state.data
             
+            uploaded_file.seek(0)
+            
+            # Show loading message
+            with st.spinner("📂 Processing your file..."):
+                # Use the smart CSV loader
+                df = smart_load_csv(uploaded_file)
+            
+            if df is None:
+                st.error("❌ Could not process this file format")
+                return None
+            
+            # ========== SUCCESS - SHOW CLEAN PREVIEW ==========
+            st.success(f"✅ File loaded successfully!")
+            
+            # Create a clean preview table
+            preview_col1, preview_col2 = st.columns(2)
+            
+            with preview_col1:
+                st.metric("📊 Total Rows", f"{len(df):,}")
+            with preview_col2:
+                st.metric("📋 Total Columns", len(df.columns))
+            
+            # Show column names in an organized way
+            with st.expander("📋 Column Structure", expanded=True):
+                # Split columns into categories
+                metric_cols = []
+                demographic_cols = []
+                other_cols = []
+                
+                for col in df.columns:
+                    col_upper = col.upper()
+                    if any(x in col_upper for x in ['RANK', 'VISITORS', 'PURCHASERS', 'CONVERSION', 'COMBO']):
+                        metric_cols.append(col)
+                    elif any(x in col_upper for x in ['AGE', 'GENDER', 'INCOME', 'STATE', 'CREDIT', 'MARRIED', 'HOME']):
+                        demographic_cols.append(col)
+                    else:
+                        other_cols.append(col)
+                
+                col_preview1, col_preview2, col_preview3 = st.columns(3)
+                
+                with col_preview1:
+                    st.markdown("**📊 Metrics**")
+                    if metric_cols:
+                        for col in metric_cols:
+                            st.markdown(f"• {col}")
+                    else:
+                        st.caption("None")
+                
+                with col_preview2:
+                    st.markdown("**👥 Demographics**")
+                    if demographic_cols:
+                        for col in demographic_cols[:10]:  # Limit to 10
+                            st.markdown(f"• {col}")
+                        if len(demographic_cols) > 10:
+                            st.caption(f"...and {len(demographic_cols) - 10} more")
+                    else:
+                        st.caption("None")
+                
+                with col_preview3:
+                    st.markdown("**📁 Other Fields**")
+                    if other_cols:
+                        for col in other_cols[:10]:  # Limit to 10
+                            st.markdown(f"• {col}")
+                        if len(other_cols) > 10:
+                            st.caption(f"...and {len(other_cols) - 10} more")
+                    else:
+                        st.caption("None")
+            
+            # Show data preview
+            with st.expander("👁️ Data Preview (First 10 Rows)", expanded=True):
+                st.dataframe(
+                    df.head(10),
+                    use_container_width=True,
+                    height=400
+                )
+            
+            # Update session state
             st.session_state.current_file_hash = file_hash
             
+            # Log the upload
+            from datetime import datetime
             log_audit(st.session_state.user_email, 'Data Upload', 
                      f'Uploaded file: {uploaded_file.name}, Rows: {len(df)}')
             
-            file_data_json = df.to_json(orient='records')
-            
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute('INSERT INTO upload_history (user_email, filename, upload_date, row_count, file_data) VALUES (?, ?, ?, ?, ?)',
-                     (st.session_state.user_email, uploaded_file.name, datetime.now().isoformat(), len(df), file_data_json))
-            conn.commit()
-            conn.close()
+            # Store in database (do this silently in background)
+            try:
+                file_data_json = df.to_json(orient='records')
+                
+                conn = get_db_connection()
+                c = conn.cursor()
+                c.execute('''INSERT INTO upload_history 
+                            (user_email, filename, upload_date, row_count, file_data) 
+                            VALUES (?, ?, ?, ?, ?)''',
+                         (st.session_state.user_email, 
+                          uploaded_file.name, 
+                          datetime.now().isoformat(), 
+                          len(df), 
+                          file_data_json))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                # Don't show error to user, just log it
+                print(f"Database storage error: {e}")
             
             return df
             
         except Exception as e:
-            st.error(f"Error loading file: {e}")
-            import traceback
-            st.code(traceback.format_exc())
+            st.error(f"❌ Error loading file: {str(e)}")
+            with st.expander("🐛 Technical Details"):
+                import traceback
+                st.code(traceback.format_exc())
             return None
+    
     return None
-
 # Apply filters function
 def apply_filters(df, filters):
     filtered_df = df.copy()
@@ -809,12 +2065,37 @@ def show_dashboard():
 def show_home_dashboard(df):
     st.title("🏠 Home Dashboard - Buyer Intelligence")
     
+    # ========== STEP 1: VALIDATE REQUIRED COLUMNS ==========
     required_cols = ['Purchasers', 'Conversion %', 'Combo Size']
     missing = [col for col in required_cols if col not in df.columns]
     if missing:
         st.error(f"Missing required columns: {', '.join(missing)}")
         return
     
+    # ========== STEP 2: DYNAMIC COLUMN DETECTION ==========
+    all_possible_demographics = {
+        'AGE_RANGE': ['AGE_RANGE', 'Age_Range', 'Age Range', 'AGE'],
+        'INCOME_RANGE': ['INCOME_RANGE', 'Income_Range', 'Income Range', 'INCOME'],
+        'GENDER': ['GENDER', 'Gender'],
+        'STATE': ['STATE', 'State', 'PERSONAL_STATE', 'Shipping Country'],
+        'CREDIT_RATING': ['CREDIT_RATING', 'Credit_Rating', 'SKIPTRACE_CREDIT_RATING'],
+        'HOME_OWNER': ['HOME_OWNER', 'Home_Owner', 'HOMEOWNER', 'Homeowner'],
+        'MARRIED': ['MARRIED', 'Married'],
+        'CHILDREN': ['CHILDREN', 'Children'],
+        'NET_WORTH': ['NET_WORTH', 'Net_Worth']
+    }
+    
+    # Find which columns actually exist in the data
+    available_demographics = {}
+    for standard_name, variations in all_possible_demographics.items():
+        for variation in variations:
+            if variation in df.columns:
+                available_demographics[standard_name] = variation
+                break
+    
+    st.info(f"📊 Detected demographic columns: {', '.join(available_demographics.keys()) if available_demographics else 'None'}")
+    
+    # ========== STEP 3: GLOBAL FILTERS ==========
     st.subheader("🎛️ Global Filters")
     col1, col2, col3 = st.columns(3)
     
@@ -823,7 +2104,17 @@ def show_home_dashboard(df):
     with col2:
         min_conversion = st.slider("Min Conversion %", 0.0, 10.0, 4.0, 0.1)
     with col3:
-        combo_size_range = st.slider("Combo Size", 1, 5, (2, 5))
+        # FIX: Handle case where Combo Size has only one unique value
+        min_combo = int(df['Combo Size'].min()) if 'Combo Size' in df.columns else 1
+        max_combo = int(df['Combo Size'].max()) if 'Combo Size' in df.columns else 5
+        
+        if min_combo == max_combo:
+            # If all combos have the same size, show it as text instead of slider
+            st.metric("Combo Size", f"{min_combo}")
+            combo_size_range = (min_combo, max_combo)
+        else:
+            # Normal slider with proper range
+            combo_size_range = st.slider("Combo Size", min_combo, max_combo, (min_combo, max_combo))
     
     filtered_df = df[
         (df['Purchasers'] >= min_purchasers) &
@@ -832,6 +2123,7 @@ def show_home_dashboard(df):
         (df['Combo Size'] <= combo_size_range[1])
     ]
     
+    # ========== STEP 4: KEY METRICS ==========
     st.subheader("📊 Key Metrics")
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     
@@ -840,9 +2132,10 @@ def show_home_dashboard(df):
         st.metric("Total Buyers", f"{total_buyers:,}")
     
     with kpi2:
-        top_50_buyers = int(filtered_df.nlargest(50, 'Conversion %')['Purchasers'].sum())
+        top_50_count = min(50, len(filtered_df))
+        top_50_buyers = int(filtered_df.nlargest(top_50_count, 'Conversion %')['Purchasers'].sum())
         pct_from_top = (top_50_buyers / total_buyers * 100) if total_buyers > 0 else 0
-        st.metric("% from Top 50 Combos", f"{pct_from_top:.1f}%")
+        st.metric(f"% from Top {top_50_count} Combos", f"{pct_from_top:.1f}%")
     
     with kpi3:
         if len(filtered_df) > 0:
@@ -860,21 +2153,20 @@ def show_home_dashboard(df):
     
     st.divider()
     
-    # Search section
+    # ========== STEP 5: SEARCH ==========
     st.subheader("🔍 Search and Analyze Data")
-    search = st.text_input("Search across all columns (e.g., age range, state, income, etc.)", "")
+    search = st.text_input("Search across all columns", "")
     
     display_df = filtered_df.copy()
     
     if search:
         mask = display_df.astype(str).apply(lambda x: x.str.contains(search, case=False, na=False)).any(axis=1)
         search_result_df = display_df[mask]
-        st.session_state.search_result = search_result_df
         
         if len(search_result_df) > 0:
             st.success(f"✅ Found {len(search_result_df)} matching rows")
             
-            with st.expander("📋 Search Results Preview", expanded=True):
+            with st.expander("📋 Search Results", expanded=True):
                 st.dataframe(search_result_df, use_container_width=True, height=300)
                 
                 csv_search = search_result_df.to_csv(index=False)
@@ -882,11 +2174,9 @@ def show_home_dashboard(df):
                     label="📥 Export Search Results",
                     data=csv_search,
                     file_name=f"search_results_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    key="export_search"
+                    mime="text/csv"
                 )
-            
-            # === REPLACE THE OLD BUTTON WITH THIS NEW CODE ===
+             # === REPLACE THE OLD BUTTON WITH THIS NEW CODE ===
             if st.button("Create Detailed Insights from Search Results"):
                 st.session_state.showing_insights = search_result_df
                 st.session_state.insights_title = "Search Results Analysis"
@@ -910,6 +2200,7 @@ def show_home_dashboard(df):
         else:
             st.session_state.search_result = None
     
+    # ========== STEP 6: TOP COMBOS TABLE ==========
     st.subheader("📈 All Top Converting Combos")
     st.dataframe(display_df, use_container_width=True, height=400)
     
@@ -918,111 +2209,99 @@ def show_home_dashboard(df):
         label="📥 Export Full Data to CSV",
         data=csv,
         file_name=f"top_combos_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv",
-        key="export_full"
+        mime="text/csv"
     )
     
     st.divider()
     
-    # Demographic charts with custom colors
-    col1, col2 = st.columns(2)
+    # ========== STEP 7: DYNAMIC DEMOGRAPHIC CHARTS ==========
+    st.subheader("📊 Demographic Analysis")
     
-    with col1:
-        with st.expander("👥 Top Age Ranges by Buyers", expanded=True):
-            if 'AGE_RANGE' in df.columns:
-                age_data = df.groupby('AGE_RANGE')['Purchasers'].sum().nlargest(10).reset_index()
-                fig = px.bar(age_data, x='AGE_RANGE', y='Purchasers', 
-                           title='Top 10 Age Ranges',
-                           color='Purchasers',
-                           color_continuous_scale=COLOR_PALETTES['purple'])
-                fig.update_layout(
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    font=dict(family="Inter", size=12),
-                    title_font_size=16,
-                    showlegend=False
-                )
-                st.plotly_chart(fig, use_container_width=True)
+    if not available_demographics:
+        st.info("No demographic columns detected in this dataset")
+    else:
+        # Create charts dynamically based on available columns
+        col1, col2 = st.columns(2)
+        chart_count = 0
         
-        with st.expander("💰 Top Income Ranges by Buyers", expanded=True):
-            if 'INCOME_RANGE' in df.columns:
-                income_data = df.groupby('INCOME_RANGE')['Purchasers'].sum().nlargest(10).reset_index()
-                fig = px.bar(income_data, x='Purchasers', y='INCOME_RANGE', 
-                           orientation='h', title='Top 10 Income Ranges',
-                           color='Purchasers',
-                           color_continuous_scale=COLOR_PALETTES['gradient'])
-                fig.update_layout(
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    font=dict(family="Inter", size=12),
-                    title_font_size=16,
-                    showlegend=False
-                )
-                st.plotly_chart(fig, use_container_width=True)
+        for standard_name, actual_col in available_demographics.items():
+            if actual_col not in df.columns:
+                continue
+                
+            try:
+                # Get top 10 values for this demographic
+                demo_data = df.groupby(actual_col)['Purchasers'].sum().nlargest(10).reset_index()
+                
+                if len(demo_data) == 0:
+                    continue
+                
+                # Determine which column to use
+                target_col = col1 if chart_count % 2 == 0 else col2
+                
+                with target_col:
+                    with st.expander(f"📊 Top {standard_name.replace('_', ' ').title()}", expanded=True):
+                        # Choose chart type based on data
+                        if len(demo_data) <= 5:
+                            fig = px.pie(demo_data, values='Purchasers', names=actual_col,
+                                       title=f'{standard_name.replace("_", " ").title()} Distribution',
+                                       color_discrete_sequence=COLOR_PALETTES['ocean'])
+                        else:
+                            fig = px.bar(demo_data, x=actual_col, y='Purchasers',
+                                       title=f'Top 10 {standard_name.replace("_", " ").title()}',
+                                       color='Purchasers',
+                                       color_continuous_scale=COLOR_PALETTES['purple'])
+                        
+                        fig.update_layout(
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            paper_bgcolor='rgba(0,0,0,0)',
+                            font=dict(family="Inter", size=12),
+                            title_font_size=16,
+                            showlegend=False
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                
+                chart_count += 1
+                
+            except Exception as e:
+                st.warning(f"Could not create chart for {standard_name}: {e}")
+                continue
     
-    with col2:
-        with st.expander("🗺️ Top States by Buyers", expanded=True):
-            if 'STATE' in df.columns:
-                state_data = df.groupby('STATE')['Purchasers'].sum().nlargest(10).reset_index()
-                fig = px.bar(state_data, x='STATE', y='Purchasers', 
-                           title='Top 10 States',
-                           color='Purchasers',
-                           color_continuous_scale=COLOR_PALETTES['sunset'])
-                fig.update_layout(
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    font=dict(family="Inter", size=12),
-                    title_font_size=16,
-                    showlegend=False
-                )
-                st.plotly_chart(fig, use_container_width=True)
-        
-        with st.expander("📊 Credit Rating Distribution", expanded=True):
-            if 'SKIPTRACE_CREDIT_RATING' in df.columns:
-                credit_data = df.groupby('SKIPTRACE_CREDIT_RATING')['Purchasers'].sum().reset_index()
-                fig = px.pie(credit_data, values='Purchasers', names='SKIPTRACE_CREDIT_RATING',
-                           title='Credit Rating Distribution',
-                           color_discrete_sequence=COLOR_PALETTES['ocean'])
-                fig.update_layout(
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    font=dict(family="Inter", size=12),
-                    title_font_size=16
-                )
-                st.plotly_chart(fig, use_container_width=True)
-    
+    # ========== STEP 8: BUYER CONCENTRATION ==========
     st.subheader("Buyer Concentration")
-    top_n = [5, 10, 20, 50, 100]
-    cumulative_buyers = []
-
-    for n in top_n:
-        buyers = int(filtered_df.nlargest(n, 'Conversion %')['Purchasers'].sum())
-        cumulative_buyers.append(buyers / total_buyers * 100 if total_buyers > 0 else 0)
-
-    # Updated chart with hover showing "Top X" label
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=[f'Top {n}' for n in top_n],
-        y=cumulative_buyers,
-        text=[f'{val:.1f}%' for val in cumulative_buyers],
-        textposition='auto',
-        hovertemplate='<b>%{x}</b><br>% of Total Buyers: <b>%{y:.1f}%</b><extra></extra>',  # ← This line is the fix
-        marker=dict(
-            color=cumulative_buyers,
-            colorscale=[[0, '#667eea'], [0.5, '#764ba2'], [1, '#f093fb']],
-            line=dict(color='rgba(255,255,255,0.5)', width=2)
+    
+    if total_buyers > 0:
+        top_n = [5, 10, 20, 50, 100]
+        # Adjust for smaller datasets
+        top_n = [n for n in top_n if n <= len(filtered_df)]
+        
+        cumulative_buyers = []
+        for n in top_n:
+            buyers = int(filtered_df.nlargest(n, 'Conversion %')['Purchasers'].sum())
+            cumulative_buyers.append(buyers / total_buyers * 100)
+        
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=[f'Top {n}' for n in top_n],
+            y=cumulative_buyers,
+            text=[f'{val:.1f}%' for val in cumulative_buyers],
+            textposition='auto',
+            hovertemplate='<b>%{x}</b><br>% of Total Buyers: <b>%{y:.1f}%</b><extra></extra>',
+            marker=dict(
+                color=cumulative_buyers,
+                colorscale=[[0, '#667eea'], [0.5, '#764ba2'], [1, '#f093fb']],
+                line=dict(color='rgba(255,255,255,0.5)', width=2)
+            )
+        ))
+        fig.update_layout(
+            title='Cumulative % of Total Buyers by Top Combos',
+            yaxis_title='% of Total Buyers',
+            xaxis_title='Top Combos',
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+            font=dict(family="Inter", size=12),
+            title_font_size=16
         )
-    ))
-    fig.update_layout(
-        title='Cumulative % of Total Buyers by Top Combos',
-        yaxis_title='% of Total Buyers',
-        xaxis_title='Top Combos',
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(family="Inter", size=12),
-        title_font_size=16
-    )
-    st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True)
     
 # Detailed insights from data
 def show_detailed_insights(df, title="Data"):
@@ -1170,6 +2449,30 @@ def show_top_combos(df):
 def show_segment_builder(df):
     st.title("🎨 Segment Builder")
     
+    # ========== DETECT AVAILABLE DEMOGRAPHICS ==========
+    all_possible_demographics = {
+        'AGE_RANGE': ['AGE_RANGE', 'Age_Range', 'Age Range'],
+        'INCOME_RANGE': ['INCOME_RANGE', 'Income_Range', 'Income Range'],
+        'GENDER': ['GENDER', 'Gender'],
+        'STATE': ['STATE', 'State', 'PERSONAL_STATE'],
+        'CREDIT_RATING': ['CREDIT_RATING', 'Credit_Rating', 'SKIPTRACE_CREDIT_RATING'],
+        'HOME_OWNER': ['HOME_OWNER', 'Home_Owner', 'HOMEOWNER'],
+        'MARRIED': ['MARRIED', 'Married'],
+        'CHILDREN': ['CHILDREN', 'Children'],
+        'NET_WORTH': ['NET_WORTH', 'Net_Worth']
+    }
+    
+    available_demographics = {}
+    for standard_name, variations in all_possible_demographics.items():
+        for variation in variations:
+            if variation in df.columns:
+                available_demographics[standard_name] = variation
+                break
+    
+    if not available_demographics:
+        st.warning("⚠️ No demographic columns found in this dataset")
+        return
+    
     col1, col2 = st.columns([1, 2])
     
     with col1:
@@ -1177,21 +2480,41 @@ def show_segment_builder(df):
         
         filters = {}
         
-        if 'AGE_RANGE' in df.columns:
-            age_options = df['AGE_RANGE'].dropna().unique().tolist()
-            filters['AGE_RANGE'] = st.multiselect("👥 Age Range", age_options)
-        
-        if 'INCOME_RANGE' in df.columns:
-            income_options = df['INCOME_RANGE'].dropna().unique().tolist()
-            filters['INCOME_RANGE'] = st.multiselect("💰 Income Range", income_options)
-        
-        if 'GENDER' in df.columns:
-            gender_options = df['GENDER'].dropna().unique().tolist()
-            filters['GENDER'] = st.multiselect("👤 Gender", gender_options)
-        
-        if 'STATE' in df.columns:
-            state_options = df['STATE'].dropna().unique().tolist()
-            filters['STATE'] = st.multiselect("🗺️ State", state_options)
+        # Dynamically create filters for available demographics
+        for standard_name, actual_col in available_demographics.items():
+            try:
+                # ========== CLEAN OPTIONS: REMOVE EMPTY/INVALID VALUES ==========
+                raw_options = df[actual_col].dropna().unique().tolist()
+                
+                # Filter out empty strings, whitespace, and invalid values
+                options = []
+                for opt in raw_options:
+                    opt_str = str(opt).strip()
+                    # Skip if empty, 'nan', 'none', or just whitespace
+                    if opt_str and opt_str.lower() not in ['nan', 'none', 'n/a', 'unknown', '']:
+                        options.append(opt)
+                
+                # Sort options for better UX
+                options = sorted(options, key=lambda x: str(x))
+                
+                if len(options) > 0 and len(options) < 100:
+                    emoji_map = {
+                        'AGE_RANGE': '👥',
+                        'INCOME_RANGE': '💰',
+                        'GENDER': '👤',
+                        'STATE': '🗺️',
+                        'CREDIT_RATING': '💳',
+                        'HOME_OWNER': '🏠',
+                        'MARRIED': '💍',
+                        'CHILDREN': '👶',
+                        'NET_WORTH': '💎'
+                    }
+                    emoji = emoji_map.get(standard_name, '📊')
+                    label = f"{emoji} {standard_name.replace('_', ' ').title()}"
+                    
+                    filters[actual_col] = st.multiselect(label, options)
+            except:
+                continue
     
     with col2:
         st.subheader("📊 Segment Results")
@@ -1719,7 +3042,7 @@ def show_buyer_deep_dive(df):
                 st.info("🔓 No targeting attributes defined for this combo (targets all visitors)")
                 st.caption("This means the combo includes buyers from all demographics")
             
-            # ==========================================
+             # ==========================================
             # SECTION 5: Demographic Profile of This Combo – 100% FIXED & BEAUTIFUL
             # ==========================================
             st.subheader("Demographic Profile of This Combo")
@@ -1894,23 +3217,41 @@ def show_uploads():
     st.divider()
     
     st.subheader("📤 Upload New File")
-    new_file = st.file_uploader("Upload a new CSV file", type=['csv'], key='uploads_page_uploader')
+    st.caption("Supported formats: CSV files with demographic or purchase data")
+    
+    new_file = st.file_uploader(
+        "Choose a CSV file", 
+        type=['csv'], 
+        key='uploads_page_uploader',
+        help="Upload your buyer data CSV file"
+    )
     
     if new_file:
+        # Process without excessive messages
         data = load_data(new_file)
+        
         if data is not None:
             st.session_state.data = data
-            st.success(f"✅ Uploaded and loaded {len(data)} rows successfully!")
-            st.info("Navigate to Home Dashboard to analyze the data")
-            st.rerun()
+            st.balloons()  # Fun success indicator
+            
+            # Show quick stats
+            stat_col1, stat_col2, stat_col3 = st.columns(3)
+            with stat_col1:
+                st.metric("✅ Status", "Ready")
+            with stat_col2:
+                st.metric("📊 Rows", f"{len(data):,}")
+            with stat_col3:
+                st.metric("📋 Columns", len(data.columns))
+            
+            st.info("✨ Data loaded! Navigate to **Home Dashboard** to start analyzing.")
     
     st.divider()
     
-    if st.button("🗑️ Clear Current Data"):
+    if st.button("🗑️ Clear Current Data", type="secondary"):
         st.session_state.data = None
         st.session_state.current_file_hash = None
         st.session_state.search_result = None
-        st.success("✅ Data cleared! You can upload a new file.")
+        st.success("✅ Data cleared!")
         st.rerun()
 
 # Admin Page
